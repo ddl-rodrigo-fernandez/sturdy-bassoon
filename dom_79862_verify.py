@@ -5,14 +5,25 @@ Verification script for DOM-79862.
 Run this from a Domino workspace terminal, on a git-based project (GBP) whose
 main repository is an external git remote (e.g. github.com/domino-field/git-commit-id-issue).
 
-It exercises three job_start call patterns and reports what happened:
+IMPORTANT: python-domino's job_start() has its OWN client-side check
+(_validate_commit_id -> commits_list(), which hits the classic /commits
+endpoint) that runs before it ever calls the backend, and raises
+CommitNotFoundException locally whenever commit_id isn't in that list --
+which a GBP main-repo SHA never is. This fires identically on patched and
+unpatched backends, so it can't be used to distinguish the two. Case 1
+below bypasses job_start() entirely and POSTs to /v4/jobs/start directly
+(reusing the client's auth) so it actually exercises the backend logic
+under test.
 
-  1. commit_id=<main repo HEAD sha>
-     - The bug from the ticket. On an UNPATCHED backend: job_start succeeds
-       (returns a job id), but the job pod fails during setup with
+It exercises three call patterns and reports what happened:
+
+  1. commitId=<main repo HEAD sha>, posted directly to /v4/jobs/start
+     (bypassing python-domino's client-side check)
+     - The bug from the ticket. On an UNPATCHED backend: the request
+       succeeds (returns a job id), but the job pod fails during setup with
        "Commit <sha> not found in git repository /mnt/artifacts/.domino/repo".
-     - On the PATCHED backend: job_start itself fails immediately with a 400
-       and a clear message pointing at main_repo_git_ref.
+     - On the PATCHED backend: the request itself fails immediately with a
+       400 and a clear message pointing at main_repo_git_ref.
 
   2. main_repo_git_ref={"type": "commitId", "value": <sha>}
      - The correct way to pin a commit on a git-based project's main repo.
@@ -49,16 +60,39 @@ def get_main_repo_head_sha():
     return result.stdout.strip()
 
 
-def run_case(domino, label, **job_start_kwargs):
+def raw_job_start(domino, command, commit_id=None, main_repo_git_ref=None):
+    """
+    POST directly to /v4/jobs/start, bypassing python-domino's job_start()
+    client-side validation (_validate_commit_id), so the backend's own
+    handling of commitId/mainRepoGitRef is what actually gets exercised.
+    """
+    url = domino._routes.job_start()
+    payload = {
+        "projectId": domino.project_id,
+        "commandToRun": command,
+        "commitId": commit_id,
+        "mainRepoGitRef": main_repo_git_ref,
+    }
+    response = domino.request_manager.post(url, json=payload)  # raises on non-2xx
+    return response.json()
+
+
+def run_case(domino, label, use_raw=False, **kwargs):
     print(f"\n{'=' * 70}")
     print(f"CASE: {label}")
-    print(f"job_start kwargs: {job_start_kwargs}")
+    print(f"kwargs: {kwargs}")
     print("-" * 70)
 
     try:
-        job = domino.job_start(command="echo hello from DOM-79862 verification", **job_start_kwargs)
+        if use_raw:
+            job = raw_job_start(domino, command="echo hello from DOM-79862 verification", **kwargs)
+        else:
+            job = domino.job_start(command="echo hello from DOM-79862 verification", **kwargs)
     except Exception as e:
-        print(f"RESULT: job_start() raised immediately -> {type(e).__name__}: {e}")
+        print(f"RESULT: request raised immediately -> {type(e).__name__}: {e}")
+        response = getattr(e, "response", None)
+        if response is not None:
+            print(f"response body: {response.text}")
         return
 
     job_id = job["id"]
@@ -94,8 +128,10 @@ def main():
 
     run_case(
         domino,
-        "commit_id=<main repo sha>  [the DOM-79862 bug -- expect FAILURE, "
-        "immediate on patched backend, pod failure on unpatched]",
+        "commitId=<main repo sha> via raw POST (bypassing job_start's client-side check)"
+        "  [the DOM-79862 bug -- expect FAILURE, immediate on patched backend, "
+        "pod failure on unpatched]",
+        use_raw=True,
         commit_id=sha,
     )
 
